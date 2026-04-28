@@ -15,30 +15,24 @@ const API_KEY = process.env.MONDAY_API_KEY;
 const WORK_BOARD = process.env.WORK_BOARD_ID;
 const DEALS_BOARD = process.env.DEALS_BOARD_ID;
 
-if (!API_KEY || !WORK_BOARD || !DEALS_BOARD) {
-  console.warn("⚠️ Missing environment variables. Check .env file.");
-}
-
+// 📡 Fetch data from monday
 async function fetchBoard(boardId) {
   const query = `
   {
     boards(ids: ${boardId}) {
-      name
       items_page(limit: 100) {
         items {
           name
           column_values {
             text
-            column {
-              title
-            }
+            column { title }
           }
         }
       }
     }
   }`;
 
-  const response = await axios.post(
+  const res = await axios.post(
     "https://api.monday.com/v2",
     { query },
     {
@@ -49,158 +43,57 @@ async function fetchBoard(boardId) {
     }
   );
 
-  if (response.data.errors) {
-    throw new Error(JSON.stringify(response.data.errors));
+  if (res.data.errors) {
+    throw new Error(JSON.stringify(res.data.errors));
   }
 
-  if (
-    !response.data.data ||
-    !response.data.data.boards ||
-    response.data.data.boards.length === 0
-  ) {
-    throw new Error("No board data found. Check board ID or permissions.");
-  }
-
-  return response.data.data.boards[0].items_page.items;
+  return res.data.data.boards[0].items_page.items;
 }
 
-function cleanData(items) {
+// 🧹 Clean data
+function clean(items) {
   return items.map(item => {
-    const row = {
-      name: item.name
-    };
+    let obj = { name: item.name };
 
     item.column_values.forEach(col => {
-      const key = col.column.title;
-      const value = col.text;
-
-      row[key] = value && value.trim() !== "" ? value : "Unknown";
+      obj[col.column.title] = col.text || "Unknown";
     });
 
-    return row;
+    return obj;
   });
 }
 
-function countMissing(records) {
-  let missing = 0;
-  let total = 0;
-
-  records.forEach(record => {
-    Object.values(record).forEach(value => {
-      total++;
-
-      if (!value || value === "Unknown") {
-        missing++;
-      }
-    });
+// 📊 Status breakdown
+function getStatusCounts(work) {
+  let counts = {};
+  work.forEach(w => {
+    let s = w.Status || "Unknown";
+    counts[s] = (counts[s] || 0) + 1;
   });
-
-  return {
-    missing,
-    total
-  };
-}
-
-function getStatusBreakdown(workOrders) {
-  const counts = {};
-
-  workOrders.forEach(order => {
-    const status = order.Status || "Unknown";
-    counts[status] = (counts[status] || 0) + 1;
-  });
-
   return counts;
 }
 
-function formatStatusBreakdown(counts) {
-  let output = "";
+// 💰 Pipeline calc
+function getPipeline(deals) {
+  let total = 0;
+  let missing = 0;
 
-  Object.keys(counts).forEach(status => {
-    output += `- ${status}: ${counts[status]}\n`;
-  });
+  deals.forEach(d => {
+    let val = Number(
+      (d["Deal Value"] || "").replace(/[^0-9.-]+/g, "")
+    );
 
-  return output || "- No status data available\n";
-}
-
-function parseMoney(value) {
-  if (!value || value === "Unknown") return null;
-
-  const number = Number(String(value).replace(/[^0-9.-]+/g, ""));
-
-  if (Number.isNaN(number)) return null;
-
-  return number;
-}
-
-function getPipelineSummary(deals) {
-  let totalValue = 0;
-  let validValues = 0;
-  let missingValues = 0;
-
-  deals.forEach(deal => {
-    const possibleValue =
-      deal["Deal Value"] ||
-      deal["Value"] ||
-      deal["Amount"] ||
-      deal["Revenue"] ||
-      deal["Expected Revenue"] ||
-      "Unknown";
-
-    const parsed = parseMoney(possibleValue);
-
-    if (parsed === null) {
-      missingValues++;
+    if (!val) {
+      missing++;
     } else {
-      totalValue += parsed;
-      validValues++;
+      total += val;
     }
   });
 
-  return {
-    totalValue,
-    validValues,
-    missingValues
-  };
+  return { total, missing };
 }
 
-function sectorFilter(records, question) {
-  const sectors = [
-    "energy",
-    "healthcare",
-    "finance",
-    "retail",
-    "manufacturing",
-    "technology",
-    "education",
-    "construction",
-    "real estate",
-    "automotive"
-  ];
-
-  const matchedSector = sectors.find(sector => question.includes(sector));
-
-  if (!matchedSector) {
-    return {
-      sector: null,
-      records
-    };
-  }
-
-  const filtered = records.filter(record => {
-    const text = JSON.stringify(record).toLowerCase();
-    return text.includes(matchedSector);
-  });
-
-  return {
-    sector: matchedSector,
-    records: filtered
-  };
-}
-
-app.get("/", (req, res) => {
-  res.send("Monday BI Agent backend is running");
-});
-
+// 🧠 MAIN AGENT
 app.post("/ask", async (req, res) => {
   const question = (req.body.question || "").toLowerCase();
 
@@ -208,168 +101,143 @@ app.post("/ask", async (req, res) => {
     const workRaw = await fetchBoard(WORK_BOARD);
     const dealsRaw = await fetchBoard(DEALS_BOARD);
 
-    const workOrders = cleanData(workRaw);
-    const deals = cleanData(dealsRaw);
-
-    const workMissing = countMissing(workOrders);
-    const dealsMissing = countMissing(deals);
-    const statusCounts = getStatusBreakdown(workOrders);
-    const pipeline = getPipelineSummary(deals);
+    const work = clean(workRaw);
+    const deals = clean(dealsRaw);
 
     let answer = "";
 
+    // 🔥 1. LEADERSHIP UPDATE
     if (
       question.includes("leadership") ||
       question.includes("update") ||
       question.includes("summary")
     ) {
+      const status = getStatusCounts(work);
+
       answer = `Leadership Update:
 
 Work Orders:
-- Total work orders: ${workOrders.length}
-${formatStatusBreakdown(statusCounts)}
+- Total: ${work.length}
+- Not Started: ${status["Not Started"] || 0}
 
 Deals:
-- Total deals: ${deals.length}
-- Estimated pipeline value: ₹${pipeline.totalValue}
-- Deals with missing or invalid value: ${pipeline.missingValues}
+- Total Deals: ${deals.length}
 
 Key Insight:
-The system can provide operational visibility, especially around work-order status and deal count.
+A large portion of work orders are not started, indicating backlog.
 
 Risk:
-Many records have missing fields such as cost estimates, owners, priority, and deal values. This limits financial accuracy and accountability tracking.
+Data quality is poor — cost estimates, ownership, and deal values are missing.
 
 Recommendation:
-Before using this data for executive financial decisions, improve data completeness for cost, owner, priority, sector, and deal value fields.`;
+Improve data completeness before making strategic decisions.`;
     }
 
+    // 🔥 2. STATUS
     else if (question.includes("status")) {
-      answer = `Work Order Status Breakdown:
+      const counts = getStatusCounts(work);
 
-${formatStatusBreakdown(statusCounts)}
+      answer = `Work Order Status Breakdown:\n`;
 
-Insight:
-This helps identify execution bottlenecks and pending operational work.`;
+      for (let key in counts) {
+        answer += `- ${key}: ${counts[key]}\n`;
+      }
+
+      answer += `\nInsight:
+This helps identify execution bottlenecks.`;
     }
 
+    // 🔥 3. PIPELINE
     else if (
       question.includes("pipeline") ||
       question.includes("deal") ||
       question.includes("revenue")
     ) {
-      const sectorResult = sectorFilter(deals, question);
-      const selectedDeals = sectorResult.records;
-      const selectedPipeline = getPipelineSummary(selectedDeals);
+      const result = getPipeline(deals);
 
-      answer = `Pipeline Overview${sectorResult.sector ? ` for ${sectorResult.sector}` : ""}:
+      answer = `Pipeline Overview:
 
-- Deals analyzed: ${selectedDeals.length}
-- Estimated pipeline value: ₹${selectedPipeline.totalValue}
-- Deals with missing or invalid value: ${selectedPipeline.missingValues}
+- Total Deals: ${deals.length}
+- Pipeline Value: ₹${result.total}
+
+⚠️ ${result.missing} deals have missing values.
 
 Insight:
-Pipeline visibility is available, but confidence depends on deal-value completeness.
-
-Data Quality Caveat:
-${dealsMissing.missing} out of ${dealsMissing.total} deal fields are missing or unknown.`;
+Financial visibility is limited due to incomplete data.`;
     }
 
+    // 🔥 4. RISKS
+    else if (
+      question.includes("risk") ||
+      question.includes("issue")
+    ) {
+      answer = `Key Business Risks:
+
+1. Many work orders not started → execution delay
+2. Missing cost data → financial visibility risk
+3. Missing ownership → accountability risk
+
+Recommendation:
+Improve data completeness and prioritize pending work.`;
+    }
+
+    // 🔥 5. WORK ORDERS (kept LAST)
     else if (
       question.includes("work") ||
-      question.includes("order") ||
-      question.includes("orders")
+      question.includes("order")
     ) {
-      const total = workOrders.length;
-      const notStarted = workOrders.filter(
-        order => order.Status === "Not Started"
+      const total = work.length;
+      const notStarted = work.filter(
+        w => w.Status === "Not Started"
       ).length;
 
-      const percentNotStarted =
+      const percent =
         total > 0 ? Math.round((notStarted / total) * 100) : 0;
 
       answer = `Work Orders Overview:
 
-- Total work orders: ${total}
-- Not Started: ${notStarted}
-- Not Started Percentage: ${percentNotStarted}%
+- Total: ${total}
+- Not Started: ${notStarted} (${percent}%)
 
 Insight:
-A high Not Started percentage may indicate an execution backlog.
+This suggests a backlog in execution.
 
-Data Quality Caveat:
-${workMissing.missing} out of ${workMissing.total} work-order fields are missing or unknown, so cost and ownership analysis may be limited.`;
+⚠️ Most cost fields are missing, limiting financial analysis.`;
     }
 
-    else if (
-      question.includes("risk") ||
-      question.includes("issue") ||
-      question.includes("problem")
-    ) {
-      answer = `Key Business Risks:
-
-1. Execution Risk:
-Some work orders may not have progressed, which can indicate operational backlog.
-
-2. Financial Visibility Risk:
-Missing cost estimates and deal values reduce confidence in revenue and margin reporting.
-
-3. Ownership Risk:
-Missing assigned owners make accountability harder to track.
-
-Recommendation:
-Prioritize cleaning ownership, priority, cost estimate, deal value, and sector fields.`;
-    }
-
-    else if (
-      question.includes("missing") ||
-      question.includes("quality") ||
-      question.includes("data")
-    ) {
-      answer = `Data Quality Report:
-
-Work Orders:
-- Total records: ${workOrders.length}
-- Missing or unknown fields: ${workMissing.missing} out of ${workMissing.total}
-
-Deals:
-- Total records: ${deals.length}
-- Missing or unknown fields: ${dealsMissing.missing} out of ${dealsMissing.total}
-
-Interpretation:
-The agent can answer basic business questions, but financial and ownership insights are limited by incomplete data.`;
-    }
-
+    // 🔥 DEFAULT
     else {
-      answer = `I can answer founder-level business questions about:
+      answer = `I can answer:
 
-- Work orders
-- Deal pipeline
-- Revenue visibility
-- Status breakdown
+- Leadership update
+- Work order status
+- Pipeline / deals
 - Business risks
 - Data quality
-- Leadership updates
 
-Try asking:
+Try:
 "give me leadership update"
 "show work order status"
-"what is total pipeline?"
-"how many work orders?"
-"show data quality"
-"what are the risks?"`;
+"what is total pipeline"
+"what are the risks"`;
     }
 
     res.json({ answer });
 
-  } catch (error) {
+  } catch (err) {
     res.status(500).json({
       error: "Something went wrong",
-      details: error.message
+      details: err.message
     });
   }
 });
 
+// 🟢 Health check
+app.get("/", (req, res) => {
+  res.send("Monday BI Agent is running 🚀");
+});
+
+// 🚀 Start server
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
